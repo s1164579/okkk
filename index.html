@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Loken's Star Tree (Web Safe)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <script src="https://unpkg.com/three@0.157.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { margin: 0; background: #000000; overflow: hidden; font-family: sans-serif; }
+        
+        /* 摄像头小窗口 */
+        .input_video {
+            position: absolute; top: 10px; left: 10px;
+            width: 120px; height: 90px;
+            border-radius: 8px; border: 2px solid rgba(255,215,0,0.3);
+            z-index: 90; transform: scaleX(-1);
+            opacity: 0.5; pointer-events: none;
+            /* 手机端必须隐藏原视频，否则会覆盖Canvas */
+            visibility: hidden; 
+        }
+
+        /* 状态提示文字 */
+        #status {
+            position: fixed; bottom: 30px; width: 100%; text-align: center;
+            color: rgba(255, 240, 200, 1); font-size: 1.1rem; pointer-events: none;
+            text-shadow: 0 0 10px rgba(255, 215, 0, 0.6);
+            transition: opacity 0.5s;
+            font-weight: bold;
+            z-index: 101;
+        }
+
+        #gesture-debug {
+            position: absolute; top: 10px; right: 10px;
+            color: #00ff00; font-family: monospace; font-size: 12px;
+            background: rgba(0,0,0,0.6); padding: 5px;
+            border-radius: 4px; pointer-events: none; text-align: right;
+            z-index: 102;
+        }
+
+        /* ★★★ 新增：启动遮罩层 ★★★ */
+        #overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9);
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            z-index: 999;
+        }
+        
+        /* 启动按钮 */
+        #start-btn {
+            padding: 15px 40px;
+            font-size: 1.5rem;
+            color: #fff;
+            background: linear-gradient(45deg, #D42426, #2E8B57);
+            border: 2px solid #FFD700;
+            border-radius: 50px;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(255, 215, 0, 0.5);
+            transition: transform 0.2s;
+        }
+        #start-btn:active { transform: scale(0.95); }
+        
+        .loading-text { margin-top: 20px; color: #aaa; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+
+    <div id="overlay">
+        <button id="start-btn">🎄 点击开启魔法 🎄</button>
+        <div class="loading-text" id="loading-msg">等待用户操作...</div>
+    </div>
+
+    <div id="status"></div>
+    <div id="gesture-debug">等待摄像头...</div>
+
+    <video class="input_video" playsinline muted autoplay></video>
+
+    <script type="module">
+        // ---------------------------------------------------------
+        // 1. 核心变量
+        // ---------------------------------------------------------
+        let isExploded = true; 
+        const SMOOTHNESS = 0.08; 
+        let currentLerp = 1.0; 
+
+        let scene, camera, renderer;
+        let treeParticles, treeGeo;
+        let starParticles, starGeo;
+        let ribbonParticles, ribbonGeo;
+        
+        // 保持流畅版的低配置
+        const PARTICLE_COUNT = 18000; 
+        const STAR_PARTICLE_COUNT = 1500; 
+        const RIBBON_COUNT = 2000; 
+
+        const treeTargets = new Float32Array(PARTICLE_COUNT * 3);
+        const textTargets = new Float32Array(PARTICLE_COUNT * 3);
+        const ribbonTreeTargets = new Float32Array(RIBBON_COUNT * 3);
+        const ribbonRandomTargets = new Float32Array(RIBBON_COUNT * 3);
+
+        const overlay = document.getElementById('overlay');
+        const startBtn = document.getElementById('start-btn');
+        const loadingMsg = document.getElementById('loading-msg');
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        const statusElement = document.getElementById('status');
+        const debugElement = document.getElementById('gesture-debug');
+
+        // ---------------------------------------------------------
+        // 2. 数据生成 (文字)
+        // ---------------------------------------------------------
+        function generateTextTargets() {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const width = 1600; const height = 800;
+            canvas.width = width; canvas.height = height;
+
+            ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, width, height);
+            ctx.fillStyle = '#FFFFFF'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            
+            ctx.font = '900 220px "Arial Black", sans-serif'; 
+            ctx.fillText("Loken", width / 2, height / 2 - 100);
+            ctx.font = 'bold 90px "Arial", sans-serif';
+            ctx.fillText("Merry Christmas", width / 2, height / 2 + 80);
+
+            const imageData = ctx.getImageData(0, 0, width, height);
+            const data = imageData.data;
+            const validPoints = [];
+            const step = 5; 
+
+            for (let y = 0; y < height; y += step) {
+                for (let x = 0; x < width; x += step) {
+                    if (data[(y * width + x) * 4] > 100) { 
+                        const px = (x - width / 2) * 0.045; 
+                        const py = -(y - height / 2) * 0.045 + 10;
+                        validPoints.push(px, py, 0);
+                    }
+                }
+            }
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                if (i < validPoints.length / 3) {
+                    textTargets[i*3] = validPoints[i*3];
+                    textTargets[i*3+1] = validPoints[i*3+1];
+                    textTargets[i*3+2] = validPoints[i*3+2];
+                } else {
+                    const r = 45 + Math.random() * 35;
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+                    textTargets[i*3] = r * Math.sin(phi) * Math.cos(theta);
+                    textTargets[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+                    textTargets[i*3+2] = r * Math.cos(phi);
+                }
+            }
+        }
+
+        // ---------------------------------------------------------
+        // 3. Three.js 初始化
+        // ---------------------------------------------------------
+        function createGlowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 16; canvas.height = 16; 
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(8, 8, 0, 8, 8, 8);
+            grad.addColorStop(0, 'rgba(255, 255, 255, 1)'); 
+            grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = grad; ctx.fillRect(0, 0, 16, 16);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.015); 
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
+            camera.position.set(0, 8, 45); camera.lookAt(0, 10, 0); 
+
+            renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.1; 
+            document.body.appendChild(renderer.domElement);
+
+            generateTextTargets();
+            createTreeData();
+            createRibbonData();
+
+            createParticles();     
+            createRibbons();       
+            createParticleStar();  
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        // 几何五角星
+        function createParticleStar() {
+            starGeo = new THREE.BufferGeometry();
+            const positions = [];
+            const colors = [];
+            const cCore = new THREE.Color(0xFFFFFF); 
+            const cTip = new THREE.Color(0xFFD700);  
+            const outerR = 1.6; const innerR = 0.6; const depth = 0.5;  
+
+            const baseVertices = [];
+            for (let i = 0; i < 10; i++) {
+                const r = (i % 2 === 0) ? outerR : innerR;
+                const angle = i * (Math.PI * 2 / 10) - Math.PI / 2;
+                baseVertices.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r, z: 0 });
+            }
+            const frontTip = { x: 0, y: 0, z: depth };
+            const backTip = { x: 0, y: 0, z: -depth };
+            const center = { x: 0, y: 0, z: 0 };
+
+            for (let i = 0; i < STAR_PARTICLE_COUNT; i++) {
+                const sector = Math.floor(Math.random() * 10);
+                const pA = center; const pB = baseVertices[sector]; const pC = baseVertices[(sector + 1) % 10]; 
+                const isFront = Math.random() > 0.5; const pApex = isFront ? frontTip : backTip;
+                let s = Math.sqrt(Math.random()); let t = Math.random();
+                let bx = (1-s) * pA.x + s * (1-t) * pB.x + s * t * pC.x;
+                let by = (1-s) * pA.y + s * (1-t) * pB.y + s * t * pC.y;
+                let bz = (1-s) * pA.z + s * (1-t) * pB.z + s * t * pC.z; 
+                let h = 1 - Math.sqrt(Math.random()); 
+                let x = bx + (pApex.x - bx) * h;
+                let y = by + (pApex.y - by) * h;
+                let z = bz + (pApex.z - bz) * h;
+                positions.push(x, y, z);
+                const dist = Math.sqrt(x*x + y*y + z*z);
+                const colorMix = Math.min(1, dist / outerR);
+                const c = cCore.clone().lerp(cTip, colorMix);
+                colors.push(c.r, c.g, c.b);
+            }
+            starGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            starGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            const mat = new THREE.PointsMaterial({ size: 0.15, map: createGlowTexture(), vertexColors: true, transparent: true, opacity: 1.0, blending: THREE.AdditiveBlending, depthWrite: false });
+            starParticles = new THREE.Points(starGeo, mat);
+            starParticles.position.set(0, 21.6, 0); 
+            scene.add(starParticles);
+        }
+
+        function createTreeData() {
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const h = Math.random() * 22; 
+                const rBase = (1 - h / 23) * 7.5 + Math.random() * 0.5;
+                const angle = h * 5 + Math.random() * Math.PI * 2; 
+                treeTargets[i*3] = Math.cos(angle) * rBase;
+                treeTargets[i*3+1] = h - 2; 
+                treeTargets[i*3+2] = Math.sin(angle) * rBase;
+            }
+        }
+
+        function createRibbonData() {
+            for (let i = 0; i < RIBBON_COUNT; i++) {
+                const h = (i / RIBBON_COUNT) * 22; 
+                const rBase = (1 - h / 23.5) * 8.5; 
+                const angle = h * 4 + Math.PI * 2; 
+                ribbonTreeTargets[i*3] = Math.cos(angle) * rBase;
+                ribbonTreeTargets[i*3+1] = h - 2; 
+                ribbonTreeTargets[i*3+2] = Math.sin(angle) * rBase;
+                const r = 30 + Math.random() * 20; const theta = Math.random() * Math.PI * 2; const phi = Math.acos(2 * Math.random() - 1);
+                ribbonRandomTargets[i*3] = r * Math.sin(phi) * Math.cos(theta);
+                ribbonRandomTargets[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+                ribbonRandomTargets[i*3+2] = r * Math.cos(phi);
+            }
+        }
+
+        function createParticles() {
+            treeGeo = new THREE.BufferGeometry();
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const colors = [];
+            const c1 = new THREE.Color('#D42426'); const c2 = new THREE.Color('#2E8B57'); const c3 = new THREE.Color('#FFFFFF'); 
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                positions[i*3] = textTargets[i*3]; positions[i*3+1] = textTargets[i*3+1]; positions[i*3+2] = textTargets[i*3+2];
+                let color; const rnd = Math.random();
+                if(rnd < 0.3) color = c3; else if (rnd < 0.7) color = c2; else color = c1;
+                colors.push(color.r, color.g, color.b);
+            }
+            treeGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            treeGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            const mat = new THREE.PointsMaterial({ size: 0.28, map: createGlowTexture(), vertexColors: true, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false });
+            treeParticles = new THREE.Points(treeGeo, mat);
+            scene.add(treeParticles);
+        }
+
+        function createRibbons() {
+            ribbonGeo = new THREE.BufferGeometry();
+            const positions = new Float32Array(RIBBON_COUNT * 3);
+            const colors = [];
+            for(let i=0; i<RIBBON_COUNT; i++){
+                positions[i*3] = ribbonRandomTargets[i*3]; positions[i*3+1] = ribbonRandomTargets[i*3+1]; positions[i*3+2] = ribbonRandomTargets[i*3+2];
+                colors.push(1.0, 0.85, 0.5); 
+            }
+            ribbonGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            ribbonGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            ribbonParticles = new THREE.Points(ribbonGeo, new THREE.PointsMaterial({ size: 0.20, map: createGlowTexture(), vertexColors: true, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false }));
+            scene.add(ribbonParticles);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const targetLerp = isExploded ? 1.0 : 0.0;
+            currentLerp += (targetLerp - currentLerp) * SMOOTHNESS;
+
+            const treePos = treeGeo.attributes.position.array;
+            for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+                treePos[i] = treeTargets[i] * (1 - currentLerp) + textTargets[i] * currentLerp;
+                treePos[i+1] = treeTargets[i+1] * (1 - currentLerp) + textTargets[i+1] * currentLerp;
+                treePos[i+2] = treeTargets[i+2] * (1 - currentLerp) + textTargets[i+2] * currentLerp;
+            }
+            treeGeo.attributes.position.needsUpdate = true;
+
+            const ribbonPos = ribbonGeo.attributes.position.array;
+            for (let i = 0; i < RIBBON_COUNT * 3; i++) {
+                ribbonPos[i] = ribbonTreeTargets[i] * (1 - currentLerp) + ribbonRandomTargets[i] * currentLerp;
+                ribbonPos[i+1] = ribbonTreeTargets[i+1] * (1 - currentLerp) + ribbonRandomTargets[i+1] * currentLerp;
+                ribbonPos[i+2] = ribbonTreeTargets[i+2] * (1 - currentLerp) + ribbonRandomTargets[i+2] * currentLerp;
+            }
+            ribbonGeo.attributes.position.needsUpdate = true;
+
+            const rotSpeed = 0.003 * (1 - currentLerp);
+            treeParticles.rotation.y += rotSpeed;
+            ribbonParticles.rotation.y += rotSpeed;
+
+            if (starParticles) {
+                starParticles.rotation.y -= 0.02; 
+                const pulse = 1 + Math.sin(Date.now() * 0.003) * 0.05;
+                const scale = Math.max(0.01, (1 - currentLerp) * pulse);
+                starParticles.scale.set(scale, scale, scale);
+                starParticles.material.opacity = Math.max(0, 1 - currentLerp * 1.5);
+                starParticles.position.y = 21.6 + Math.sin(Date.now() * 0.002) * 0.3;
+            }
+            renderer.render(scene, camera);
+        }
+
+        // ---------------------------------------------------------
+        // 4. MediaPipe 手势识别
+        // ---------------------------------------------------------
+        function dist(p1, p2) {
+            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+        }
+
+        function onResults(results) {
+            // 一旦成功获取数据，就隐藏遮罩层
+            if (overlay.style.display !== 'none') {
+                overlay.style.display = 'none';
+                statusElement.innerHTML = "✨ 魔法已启动 ✨<br>🖐 张开 = 名字 | ✊ 握拳 = 圣诞树";
+            }
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const hand = results.multiHandLandmarks[0];
+                const wrist = hand[0];
+                const middleMCP = hand[9];
+                const palmSize = dist(wrist, middleMCP);
+                const tips = [4, 8, 12, 16, 20];
+                let totalTipDist = 0;
+                tips.forEach(idx => { totalTipDist += dist(wrist, hand[idx]); });
+                const avgTipDist = totalTipDist / 5;
+                const ratio = avgTipDist / palmSize;
+                debugElement.innerHTML = `手掌: ${palmSize.toFixed(2)} | 状态: ${isExploded ? '张开' : '握拳'}`;
+                if (ratio > 1.4) isExploded = true;
+                else if (ratio < 1.1) isExploded = false;
+            } else {
+                debugElement.innerText = "寻找手势中...";
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 1, 
+            modelComplexity: 0, 
+            minDetectionConfidence: 0.5, 
+            minTrackingConfidence: 0.5
+        });
+        
+        hands.onResults(onResults);
+
+        initThree();
+        animate();
+
+        // ---------------------------------------------------------
+        // ★★★ 核心：点击按钮才启动摄像头 ★★★
+        // ---------------------------------------------------------
+        let cameraUtils;
+        
+        startBtn.addEventListener('click', () => {
+            loadingMsg.innerText = "正在召唤摄像头与AI模型 (首次加载约需10-20秒)...";
+            startBtn.style.display = 'none';
+            
+            try {
+                cameraUtils = new Camera(videoElement, {
+                    onFrame: async () => { await hands.send({image: videoElement}); },
+                    width: 640, height: 480
+                });
+                
+                cameraUtils.start()
+                    .then(() => {
+                        console.log("Camera started");
+                        // 视频开始后，等待第一帧数据来关闭遮罩
+                    })
+                    .catch(err => {
+                        console.error(err);
+                        loadingMsg.innerText = "摄像头启动失败: " + err;
+                        loadingMsg.style.color = "red";
+                        alert("无法启动摄像头，请检查权限设置。如果是微信/微博内打开，请点击右上角选择在浏览器打开。");
+                    });
+            } catch (e) {
+                loadingMsg.innerText = "初始化错误: " + e;
+            }
+        });
+
+    </script>
+</body>
+</html>
